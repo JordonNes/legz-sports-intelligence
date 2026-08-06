@@ -7,15 +7,16 @@ from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field
 
 from app.data_sources import LEAGUES, LiveDataError, LiveSportsClient
+from app.predictions import build_report
 
-APP_VERSION = "0.6.0"
+APP_VERSION = "0.7.0"
 BASE_DIR = Path(__file__).resolve().parent
 STATIC_DIR = BASE_DIR / "static"
 SUPPORTED_LEAGUES = tuple(LEAGUES)
 live = LiveSportsClient()
 
 app = FastAPI(title="LEGZ Sports Intelligence", version=APP_VERSION,
-              description="Evidence-first sports analysis with live source adapters and explicit uncertainty controls.")
+              description="Evidence-first sports analysis with live source adapters, ranked predictions, and explicit uncertainty controls.")
 
 class TicketRequest(BaseModel):
     league: Literal["MLB", "WNBA", "NFL", "NBA", "NHL", "UFC"]
@@ -41,7 +42,7 @@ def health() -> dict:
     return {
         "status": "ok",
         "version": APP_VERSION,
-        "mode": "live-data-foundation",
+        "mode": "ranked-live-intelligence",
         "live_data_connected": True,
         "supported_leagues": list(SUPPORTED_LEAGUES),
         "providers": {
@@ -66,6 +67,10 @@ def schedule(league: str, on_date: date | None = Query(default=None)) -> dict:
 def odds(league: str) -> dict:
     return _call(lambda: live.odds(league))
 
+@app.get("/api/live/{league}/player-odds")
+def player_odds(league: str, max_events: int = Query(default=5, ge=1, le=10)) -> dict:
+    return _call(lambda: live.player_odds(league, max_events))
+
 @app.get("/api/live/{league}/injuries")
 def injuries(league: str) -> dict:
     return _call(lambda: live.injuries(league))
@@ -74,20 +79,43 @@ def injuries(league: str) -> dict:
 def lineup(league: str, event_id: str) -> dict:
     return _call(lambda: live.lineup(league, event_id))
 
+@app.get("/api/predictions/{league}")
+def predictions(
+    league: str,
+    scope: Literal["day", "week"] = "day",
+    limit: int = Query(default=10, ge=1, le=10),
+    include_players: bool = True,
+    max_player_events: int = Query(default=5, ge=1, le=10),
+) -> dict:
+    normalized = league.upper()
+    if normalized not in LEAGUES:
+        raise HTTPException(404, f"Unsupported league: {league}")
+    team_odds = _call(lambda: live.odds(normalized))
+    player_payload = _call(lambda: live.player_odds(normalized, max_player_events)) if include_players else {"data": []}
+    report = build_report(normalized, scope, team_odds, player_payload.get("data", []), limit)
+    report["sources"] = {
+        "team_odds": team_odds.get("source"),
+        "player_odds": player_payload.get("source"),
+        "team_usage": team_odds.get("usage", {}),
+        "player_usage": player_payload.get("usage", {}),
+    }
+    return report
+
 @app.post("/api/ticket")
 def ticket(payload: TicketRequest) -> dict:
-    schedule_data = _call(lambda: live.schedules(payload.league))
-    odds_data = _call(lambda: live.odds(payload.league))
+    report = predictions(payload.league, "day", 10, True, 5)
+    picks = report["top_overall"]
+    max_legs = {"conservative": 2, "balanced": 3, "aggressive": 5}[payload.risk]
+    eligible = [pick for pick in picks if pick["confidence"] >= {"conservative": 0.68, "balanced": 0.60, "aggressive": 0.54}[payload.risk]]
     return {
         "league": payload.league,
         "risk": payload.risk,
-        "status": "DATA_READY" if schedule_data["data"] and odds_data["data"] else "PASS",
-        "schedule": schedule_data,
-        "odds": odds_data,
-        "ticket": [],
-        "confidence": 0.0,
-        "legz": "Live events and available odds were retrieved. Automated selections remain disabled until a validated projection and backtesting layer is added.",
-        "jinx": "Current data is not the same as a proven edge. Confirm injuries, starters, timestamps, book, and price before acting.",
+        "status": "READY" if eligible else "PASS",
+        "ticket": eligible[:max_legs],
+        "confidence": round(sum(item["confidence"] for item in eligible[:max_legs]) / max(1, len(eligible[:max_legs])), 4),
+        "legz": "LEGZ selected only candidates meeting the configured evidence threshold.",
+        "jinx": "Jinx warns that parlay legs compound risk and may be correlated. Recheck prices, injuries, and lineups immediately before use.",
+        "report": report,
     }
 
 @app.post("/api/evaluate-market")
