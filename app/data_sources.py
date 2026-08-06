@@ -19,17 +19,30 @@ class LiveDataError(RuntimeError):
     pass
 
 class LiveSportsClient:
+    PLAYER_MARKETS = {
+        "MLB": "batter_hits,batter_total_bases,batter_rbis,batter_runs_scored,pitcher_strikeouts",
+        "WNBA": "player_points,player_rebounds,player_assists,player_threes",
+        "NBA": "player_points,player_rebounds,player_assists,player_threes",
+        "NFL": "player_pass_yds,player_pass_tds,player_rush_yds,player_receptions,player_reception_yds",
+        "NHL": "player_points,player_shots_on_goal,player_total_saves",
+        "UFC": "fight_method_of_victory,fight_total_rounds",
+    }
+
     def __init__(self, timeout: float = 10.0):
         self.timeout = timeout
 
-    def _get(self, url: str, params: dict[str, Any] | None = None, headers: dict[str, str] | None = None) -> Any:
+    def _get_response(self, url: str, params: dict[str, Any] | None = None, headers: dict[str, str] | None = None) -> tuple[Any, dict[str, str]]:
         try:
             with httpx.Client(timeout=self.timeout, follow_redirects=True) as client:
                 response = client.get(url, params=params, headers=headers)
                 response.raise_for_status()
-                return response.json()
+                usage = {key: response.headers.get(key) for key in ("x-requests-remaining", "x-requests-used", "x-requests-last") if response.headers.get(key) is not None}
+                return response.json(), usage
         except (httpx.HTTPError, ValueError) as exc:
             raise LiveDataError(str(exc)) from exc
+
+    def _get(self, url: str, params: dict[str, Any] | None = None, headers: dict[str, str] | None = None) -> Any:
+        return self._get_response(url, params, headers)[0]
 
     def schedules(self, league: str, on_date: date | None = None) -> dict[str, Any]:
         league = league.upper()
@@ -69,14 +82,32 @@ class LiveSportsClient:
         api_key = os.getenv("THE_ODDS_API_KEY")
         if api_key:
             _, _, sport_key = LEAGUES[league]
-            raw = self._get(f"https://api.the-odds-api.com/v4/sports/{sport_key}/odds", params={"apiKey": api_key, "regions": os.getenv("ODDS_REGIONS", "us"), "markets": os.getenv("ODDS_MARKETS", "h2h,spreads,totals"), "oddsFormat": "american", "dateFormat": "iso"})
-            return self._result("The Odds API", raw)
+            raw, usage = self._get_response(f"https://api.the-odds-api.com/v4/sports/{sport_key}/odds", params={"apiKey": api_key, "regions": os.getenv("ODDS_REGIONS", "us"), "markets": os.getenv("ODDS_MARKETS", "h2h,spreads,totals"), "oddsFormat": "american", "dateFormat": "iso"})
+            return self._result("The Odds API", raw, usage=usage)
         schedules = self.schedules(league)
         embedded = []
         for event in schedules["data"]:
             for odd in event.get("odds", []):
                 embedded.append({"event_id": event.get("id"), "event": event.get("name"), **odd})
         return self._result("ESPN embedded odds", embedded, note="Limited coverage; add THE_ODDS_API_KEY for multi-book odds.")
+
+    def player_odds(self, league: str, max_events: int = 5) -> dict[str, Any]:
+        league = league.upper()
+        api_key = os.getenv("THE_ODDS_API_KEY")
+        if not api_key:
+            return self._result("The Odds API", [], note="THE_ODDS_API_KEY is required for player-prop markets.")
+        _, _, sport_key = LEAGUES[league]
+        events, usage = self._get_response(f"https://api.the-odds-api.com/v4/sports/{sport_key}/events", params={"apiKey": api_key, "dateFormat": "iso"})
+        output = []
+        markets = os.getenv(f"{league}_PLAYER_MARKETS", self.PLAYER_MARKETS.get(league, ""))
+        for event in events[:max(1, min(max_events, 10))]:
+            try:
+                raw, call_usage = self._get_response(f"https://api.the-odds-api.com/v4/sports/{sport_key}/events/{event['id']}/odds", params={"apiKey": api_key, "regions": os.getenv("ODDS_REGIONS", "us"), "markets": markets, "oddsFormat": "american", "dateFormat": "iso"})
+                usage = call_usage or usage
+                output.append(raw)
+            except LiveDataError:
+                continue
+        return self._result("The Odds API event odds", output, note=f"Player markets requested for up to {max_events} events.", usage=usage)
 
     def injuries(self, league: str) -> dict[str, Any]:
         league = league.upper()
@@ -101,5 +132,5 @@ class LiveSportsClient:
         return self._result("ESPN event summary JSON", {"rosters": raw.get("rosters", []), "injuries": raw.get("injuries", []), "odds": raw.get("odds", []), "competitions": raw.get("header", {}).get("competitions", [])}, note="Confirmed starters may not be published until close to event time.")
 
     @staticmethod
-    def _result(source: str, data: Any, as_of: str | None = None, note: str | None = None) -> dict[str, Any]:
-        return {"source": source, "retrieved_at": datetime.now(timezone.utc).isoformat(), "as_of": as_of, "note": note, "data": data}
+    def _result(source: str, data: Any, as_of: str | None = None, note: str | None = None, usage: dict[str, str] | None = None) -> dict[str, Any]:
+        return {"source": source, "retrieved_at": datetime.now(timezone.utc).isoformat(), "as_of": as_of, "note": note, "usage": usage or {}, "data": data}
