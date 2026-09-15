@@ -6,17 +6,18 @@ from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field
 
+from app.coach_dna import CoachTendency, build_fingerprint, compare_player_under_coach, influence_score
 from app.data_sources import LEAGUES, LiveDataError, LiveSportsClient
 from app.predictions import build_report
 
-APP_VERSION = "0.7.1"
+APP_VERSION = "0.8.0"
 BASE_DIR = Path(__file__).resolve().parent
 STATIC_DIR = BASE_DIR / "static"
 SUPPORTED_LEAGUES = tuple(LEAGUES)
 live = LiveSportsClient()
 
 app = FastAPI(title="LEGZ Sports Intelligence", version=APP_VERSION,
-              description="Evidence-first sports analysis with free-first live sources, ranked predictions, and explicit uncertainty controls.")
+              description="Evidence-first sports intelligence, historical memory, Coach DNA and ranked predictions.")
 
 class TicketRequest(BaseModel):
     league: Literal["MLB", "WNBA", "NFL", "NBA", "NHL", "UFC"]
@@ -30,6 +31,21 @@ class MarketEvaluation(BaseModel):
     uncertainty: float = Field(ge=0.0, le=1.0)
     price: int | None = Field(default=None, ge=-10000, le=10000)
 
+class CoachMetricRequest(BaseModel):
+    rate: float
+    baseline_rate: float
+    sample_size: int = Field(ge=0)
+    seasons: int = Field(default=1, ge=1)
+
+class CoachFingerprintRequest(BaseModel):
+    tendencies: list[dict]
+
+class PlayerCoachRequest(BaseModel):
+    before: float | None = None
+    under: float
+    after: float | None = None
+    sample_size: int = Field(ge=0)
+
 @app.get("/", response_class=HTMLResponse)
 def home() -> HTMLResponse:
     path = STATIC_DIR / "index.html"
@@ -40,8 +56,9 @@ def home() -> HTMLResponse:
 @app.get("/api/health")
 def health() -> dict:
     return {
-        "status": "ok", "version": APP_VERSION, "mode": "free-first-ranked-intelligence",
+        "status": "ok", "version": APP_VERSION, "mode": "lsi-evidence-first",
         "live_data_connected": True, "supported_leagues": list(SUPPORTED_LEAGUES),
+        "intelligence_modules": ["predictions", "market-evaluation", "coach-dna"],
         "providers": {
             "schedules": "MLB Stats API + ESPN",
             "odds": "The Odds API when valid; ESPN fallback",
@@ -77,6 +94,22 @@ def injuries(league: str) -> dict:
 def lineup(league: str, event_id: str) -> dict:
     return _call(lambda: live.lineup(league, event_id))
 
+@app.post("/api/intelligence/nfl/coach-dna/score")
+def coach_dna_score(payload: CoachMetricRequest) -> dict:
+    return influence_score(payload.rate, payload.baseline_rate, payload.sample_size, payload.seasons)
+
+@app.post("/api/intelligence/nfl/coach-dna/fingerprint")
+def coach_dna_fingerprint(payload: CoachFingerprintRequest) -> dict:
+    try:
+        rows = [CoachTendency(**row) for row in payload.tendencies]
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(422, f"Invalid Coach DNA evidence: {exc}") from exc
+    return build_fingerprint(rows)
+
+@app.post("/api/intelligence/nfl/coach-dna/player-comparison")
+def player_coach_comparison(payload: PlayerCoachRequest) -> dict:
+    return compare_player_under_coach(payload.before, payload.under, payload.after, payload.sample_size)
+
 @app.get("/api/predictions/{league}")
 def predictions(
     league: str,
@@ -100,11 +133,9 @@ def predictions(
     unique_events = {str(event.get("id") or event.get("name")): event for event in schedule_events}
     report = build_report(normalized, scope, team_odds, player_payload.get("data", []), limit, list(unique_events.values()))
     report["sources"] = {
-        "team_odds": team_odds.get("source"),
-        "player_odds": player_payload.get("source"),
+        "team_odds": team_odds.get("source"), "player_odds": player_payload.get("source"),
         "schedules": sorted(set(source for source in schedule_sources if source)),
-        "team_usage": team_odds.get("usage", {}),
-        "player_usage": player_payload.get("usage", {}),
+        "team_usage": team_odds.get("usage", {}), "player_usage": player_payload.get("usage", {}),
     }
     return report
 
@@ -116,8 +147,8 @@ def ticket(payload: TicketRequest) -> dict:
     threshold = {"conservative": 0.68, "balanced": 0.60, "aggressive": 0.54}[payload.risk]
     eligible = [pick for pick in picks if pick["confidence"] >= threshold and pick.get("market") != "schedule-model"]
     return {
-        "league": payload.league, "risk": payload.risk,
-        "status": "READY" if eligible else "PASS", "ticket": eligible[:max_legs],
+        "league": payload.league, "risk": payload.risk, "status": "READY" if eligible else "PASS",
+        "ticket": eligible[:max_legs],
         "confidence": round(sum(item["confidence"] for item in eligible[:max_legs]) / max(1, len(eligible[:max_legs])), 4),
         "legz": "LEGZ excludes schedule-only projections from automatic tickets because no verified market price is attached.",
         "jinx": "Jinx warns that parlay legs compound risk and may be correlated. Recheck prices, injuries and lineups immediately before use.",
@@ -130,10 +161,9 @@ def evaluate_market(payload: MarketEvaluation) -> dict:
     threshold = 0.5 + (payload.uncertainty * 1.5)
     recommendation = "PASS" if abs(edge) < threshold else ("OVER" if edge > 0 else "UNDER")
     return {
-        "league": payload.league, "market": payload.market,
-        "offered_line": payload.offered_line, "projected_value": payload.projected_value,
-        "edge": round(edge, 3), "uncertainty": payload.uncertainty,
-        "confidence": round(max(0, min(1, 1 - payload.uncertainty)), 3),
-        "price": payload.price, "recommendation": recommendation,
+        "league": payload.league, "market": payload.market, "offered_line": payload.offered_line,
+        "projected_value": payload.projected_value, "edge": round(edge, 3), "uncertainty": payload.uncertainty,
+        "confidence": round(max(0, min(1, 1 - payload.uncertainty)), 3), "price": payload.price,
+        "recommendation": recommendation,
         "jinx": "This evaluates supplied numbers; it does not prove projection quality or market validity.",
     }
